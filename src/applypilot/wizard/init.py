@@ -245,10 +245,13 @@ def _setup_ai_features() -> None:
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
+    console.print(
+        "Supported providers: [bold]Gemini[/bold] (free tier), [bold]Claude[/bold] (Anthropic API), "
+        "OpenAI, local (Ollama/llama.cpp)"
+    )
     provider = Prompt.ask(
         "Provider",
-        choices=["gemini", "openai", "local"],
+        choices=["gemini", "anthropic", "openai", "local"],
         default="gemini",
     )
 
@@ -258,6 +261,16 @@ def _setup_ai_features() -> None:
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "anthropic":
+        api_key = Prompt.ask("Anthropic API key (from console.anthropic.com)")
+        base_url = Prompt.ask(
+            "Claude API base URL",
+            default="https://api.anthropic.com/v1",
+        )
+        model = Prompt.ask("Model", default="claude-haiku-4-5")
+        env_lines.append(f"ANTHROPIC_API_KEY={api_key}")
+        env_lines.append(f"ANTHROPIC_BASE_URL={base_url.rstrip('/')}")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key")

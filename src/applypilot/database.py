@@ -384,7 +384,12 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        "pending_score": (
+            "full_description IS NOT NULL AND ("
+            "fit_score IS NULL OR "
+            "(fit_score = 0 AND score_reasoning LIKE '%LLM error:%')"
+            ")"
+        ),
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "

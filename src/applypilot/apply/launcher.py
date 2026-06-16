@@ -111,7 +111,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status = 'failed')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -204,6 +204,42 @@ def release_lock(url: str) -> None:
         (url,),
     )
     conn.commit()
+
+
+def reset_stale_apply_locks(stale_minutes: int = 0) -> int:
+    """Clear in_progress locks left by crashed or interrupted apply runs.
+
+    Args:
+        stale_minutes: Unlock jobs attempted more than this many minutes ago.
+            0 (default) unlocks all in_progress tailored jobs.
+
+    Returns:
+        Number of jobs unlocked.
+    """
+    conn = get_connection()
+    if stale_minutes <= 0:
+        cur = conn.execute(
+            """
+            UPDATE jobs SET apply_status = NULL, agent_id = NULL
+            WHERE apply_status = 'in_progress'
+              AND tailored_resume_path IS NOT NULL
+            """
+        )
+    else:
+        cur = conn.execute(
+            """
+            UPDATE jobs SET apply_status = NULL, agent_id = NULL
+            WHERE apply_status = 'in_progress'
+              AND tailored_resume_path IS NOT NULL
+              AND (
+                last_attempted_at IS NULL
+                OR last_attempted_at < datetime('now', ?)
+              )
+            """,
+            (f"-{stale_minutes} minutes",),
+        )
+    conn.commit()
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +382,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # Claude Code subscription auth (OAuth) conflicts with pipeline API keys in .env.
+    # Unset LLM env vars so auto-apply uses the CLI login, not ANTHROPIC_API_KEY.
+    for _key in (
+        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+        "GEMINI_API_KEY", "OPENAI_API_KEY",
+        "LLM_URL", "LLM_MODEL", "LLM_API_KEY",
+    ):
+        env.pop(_key, None)
 
     worker_dir = reset_worker_dir(worker_id)
 
@@ -673,6 +717,12 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    stale = reset_stale_apply_locks()
+    if stale:
+        console.print(
+            f"[yellow]Released {stale} stale in_progress lock(s) from a prior interrupted run.[/yellow]"
+        )
 
     if continuous:
         effective_limit = 0

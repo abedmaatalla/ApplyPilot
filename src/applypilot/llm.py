@@ -2,13 +2,17 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
-  OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
+  GEMINI_API_KEY      -> Google Gemini (default: gemini-2.0-flash)
+  ANTHROPIC_API_KEY   -> Claude API (default: claude-haiku-4-5)
+  OPENAI_API_KEY      -> OpenAI (default: gpt-4o-mini)
+  LLM_URL             -> OpenAI-compatible endpoint (Ollama, proxies, etc.)
 
-LLM_MODEL env var overrides the model name for any provider.
+  ANTHROPIC_BASE_URL  -> Claude API base (default: https://api.anthropic.com/v1)
+  LLM_MODEL           -> Override model name for any provider
+  LLM_API_KEY         -> Bearer token when using LLM_URL (optional)
 """
 
+import json
 import logging
 import os
 import time
@@ -28,34 +32,43 @@ def _detect_provider() -> tuple[str, str, str]:
     in _bootstrap() is always visible here.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
+    if local_url:
+        return (
+            local_url.rstrip("/"),
+            model_override or "local-model",
+            os.environ.get("LLM_API_KEY", "") or anthropic_key or openai_key,
+        )
+
+    if gemini_key:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_override or "gemini-2.0-flash",
             gemini_key,
         )
 
-    if openai_key and not local_url:
+    if anthropic_key:
+        base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").rstrip("/")
+        return (
+            base,
+            model_override or "claude-haiku-4-5",
+            anthropic_key,
+        )
+
+    if openai_key:
         return (
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
             openai_key,
         )
 
-    if local_url:
-        return (
-            local_url.rstrip("/"),
-            model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
-        )
-
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -69,6 +82,18 @@ _TIMEOUT = 120  # seconds
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
+
+
+def _api_error_detail(resp: httpx.Response) -> str:
+    """Best-effort parse of provider error JSON for clearer logs."""
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return (resp.text or "").strip()[:400]
+    err = data.get("error", data)
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("error") or data)[:400]
+    return str(err)[:400]
 
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -228,7 +253,7 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                if resp.status_code in (429, 503, 529) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
@@ -243,13 +268,16 @@ class LLMClient:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
 
                     log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Tip: Gemini free tier = 15 RPM. Consider a paid account "
-                        "or switching to a local model.",
+                        "LLM overloaded/rate limited (HTTP %s). Waiting %ds before retry %d/%d.",
                         resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
+                detail = _api_error_detail(resp)
+                if resp.status_code in (400, 401, 403, 404, 422):
+                    raise RuntimeError(
+                        f"LLM request failed (HTTP {resp.status_code}): {detail}"
+                    ) from exc
                 raise
 
             except httpx.TimeoutException:

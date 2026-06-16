@@ -97,6 +97,10 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    rescore: bool = typer.Option(
+        False, "--rescore",
+        help="Re-score all jobs (not only unscored or failed).",
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -136,6 +140,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        rescore=rescore,
     )
 
     if result.get("errors"):
@@ -184,7 +189,7 @@ def apply(
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 
-    # --- Full apply mode ---
+    # --- Full apply mode (reset_stale_apply_locks runs inside apply_main) ---
 
     # Check 1: Tier 3 required (Claude Code CLI + Chrome)
     check_tier(3, "auto-apply")
@@ -204,10 +209,22 @@ def apply(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
         ).fetchone()[0]
         if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
-            )
+            stuck = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+                "AND apply_status = 'in_progress'"
+            ).fetchone()[0]
+            if stuck:
+                console.print(
+                    "[red]No jobs available to apply.[/red]\n"
+                    f"  {stuck} job(s) stuck as [bold]in_progress[/bold] from an interrupted run.\n"
+                    "  Run [bold]make apply[/bold] again (stale locks auto-release), or "
+                    "[bold]applypilot apply --reset-failed[/bold] for failed jobs."
+                )
+            else:
+                console.print(
+                    "[red]No tailored resumes ready.[/red]\n"
+                    "Run [bold]make prepare-lenient[/bold] first to prepare applications."
+                )
             raise typer.Exit(code=1)
 
     if gen:
@@ -381,16 +398,22 @@ def doctor() -> None:
     # --- Tier 2 checks ---
     import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    if has_local:
+        model = os.environ.get("LLM_MODEL", "local-model")
+        results.append(("LLM API key", ok_mark, f"Custom URL ({model}): {os.environ.get('LLM_URL')}"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+    elif has_anthropic:
+        model = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
+        base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+        results.append(("LLM API key", ok_mark, f"Claude API ({model}) @ {base}"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))

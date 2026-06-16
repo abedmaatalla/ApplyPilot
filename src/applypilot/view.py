@@ -43,22 +43,28 @@ def generate_dashboard(output_path: str | None = None) -> str:
         "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
     ).fetchone()[0]
     scored = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 1"
+    ).fetchone()[0]
+    failed = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE fit_score = 0 AND score_reasoning LIKE '%LLM error:%'"
     ).fetchone()[0]
     high_fit = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
     ).fetchone()[0]
+    moderate_plus = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 5"
+    ).fetchone()[0]
 
-    # Score distribution
+    # Score distribution (include failed 0s separately)
     score_dist: dict[int, int] = {}
-    if scored:
-        rows = conn.execute(
-            "SELECT fit_score, COUNT(*) FROM jobs "
-            "WHERE fit_score IS NOT NULL "
-            "GROUP BY fit_score ORDER BY fit_score DESC"
-        ).fetchall()
-        for r in rows:
-            score_dist[r[0]] = r[1]
+    rows = conn.execute(
+        "SELECT fit_score, COUNT(*) FROM jobs "
+        "WHERE fit_score IS NOT NULL "
+        "GROUP BY fit_score ORDER BY fit_score DESC"
+    ).fetchall()
+    for r in rows:
+        score_dist[r[0]] = r[1]
 
     # Site stats
     site_stats = conn.execute("""
@@ -72,14 +78,22 @@ def generate_dashboard(output_path: str | None = None) -> str:
         FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
-    # All scored jobs (5+), ordered by score desc
+    # All successfully scored jobs (1+), ordered by score desc
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
                fit_score, score_reasoning
         FROM jobs
-        WHERE fit_score >= 5
+        WHERE fit_score >= 1
         ORDER BY fit_score DESC, site, title
+    """).fetchall()
+
+    failed_jobs = conn.execute("""
+        SELECT url, title, site, fit_score, score_reasoning
+        FROM jobs
+        WHERE fit_score = 0 AND score_reasoning LIKE '%LLM error:%'
+        ORDER BY title
+        LIMIT 50
     """).fetchall()
 
     # Color map per site
@@ -95,13 +109,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
     # Score distribution bar chart
     score_bars = ""
     max_count = max(score_dist.values()) if score_dist else 1
-    for s in range(10, 0, -1):
+    for s in range(10, -1, -1):
         count = score_dist.get(s, 0)
         pct = (count / max_count * 100) if max_count else 0
-        score_color = "#10b981" if s >= 7 else ("#f59e0b" if s >= 5 else "#ef4444")
+        if s == 0:
+            score_color = "#ef4444"
+            label = "0 (failed)"
+        else:
+            label = str(s)
+            score_color = "#10b981" if s >= 7 else ("#f59e0b" if s >= 5 else "#94a3b8")
         score_bars += f"""
         <div class="score-row">
-          <span class="score-label">{s}</span>
+          <span class="score-label">{label}</span>
           <div class="score-bar-track">
             <div class="score-bar-fill" style="width:{pct}%;background:{score_color}"></div>
           </div>
@@ -132,10 +151,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
         if score != current_score:
             if current_score is not None:
                 job_sections += "</div>"
-            score_color = "#10b981" if score >= 7 else "#f59e0b"
+            score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#94a3b8")
             score_label = {
                 10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
                 7: "Good Fit", 6: "Moderate+", 5: "Moderate",
+                4: "Weak", 3: "Poor", 2: "Poor", 1: "Poor",
             }.get(score, f"Score {score}")
             count_at_score = score_dist.get(score, 0)
             job_sections += f"""
@@ -181,7 +201,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         job_sections += f"""
         <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
           <div class="card-header">
-            <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
+            <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
           </div>
           <div class="meta-row">{meta_html}</div>
@@ -194,6 +214,48 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
     if current_score is not None:
         job_sections += "</div>"
+
+    failed_section = ""
+    if failed_jobs:
+        failed_cards = ""
+        for j in failed_jobs:
+            title = escape(j["title"] or "Untitled")
+            url = escape(j["url"] or "")
+            site = escape(j["site"] or "")
+            err = escape((j["score_reasoning"] or "")[:120])
+            failed_cards += f"""
+        <div class="job-card failed-card">
+          <a href="{url}" class="job-title" target="_blank">{title}</a>
+          <div class="meta-row"><span class="meta-tag">{site}</span></div>
+          <div class="reasoning-row">{err}</div>
+        </div>"""
+        more = f" (showing 50 of {failed})" if failed > 50 else ""
+        failed_section = f"""
+<h2 class="score-header" style="border-color:#ef4444">
+  <span class="score-badge" style="background:#ef4444">!</span>
+  Scoring Failed{more}
+</h2>
+<p class="job-count">LLM errors — run <code>make score</code> or <code>make rescore</code> to retry.</p>
+<div class="job-grid">{failed_cards}</div>"""
+
+    empty_notice = ""
+    if not jobs and not failed_jobs:
+        empty_notice = """
+<div class="empty-state">
+  <p>No scored jobs yet. Run <code>applypilot run score</code> or <code>make score</code>.</p>
+</div>"""
+    elif not jobs and failed_jobs:
+        empty_notice = """
+<div class="empty-state">
+  <p>No valid scores yet (all jobs failed LLM scoring). Check your API key / Ollama URL, then run <code>make score</code>.</p>
+  <p>Job cards show scores 1–10. Scores 7+ unlock tailoring and auto-apply.</p>
+</div>"""
+    elif jobs and moderate_plus == 0:
+        empty_notice = """
+<div class="empty-state">
+  <p>Jobs are scored, but none rated 5+ yet. Review matches below (scores 1–4).</p>
+  <p>Scores 7+ unlock tailoring and auto-apply.</p>
+</div>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -290,6 +352,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   .hidden {{ display: none !important; }}
   .job-count {{ color: #94a3b8; font-size: 0.85rem; margin-bottom: 1rem; }}
+  .empty-state {{ background: #1e293b; border-radius: 12px; padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; color: #94a3b8; line-height: 1.6; }}
+  .empty-state code {{ background: #334155; padding: 0.15rem 0.4rem; border-radius: 4px; color: #e2e8f0; }}
+  .failed-card {{ border-left-color: #ef4444 !important; opacity: 0.85; }}
+  .stat-failed .stat-num {{ color: #ef4444; }}
 
   @media (max-width: 768px) {{
     .summary {{ grid-template-columns: repeat(2, 1fr); }}
@@ -302,18 +368,19 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <body>
 
 <h1>ApplyPilot Dashboard</h1>
-<p class="subtitle">{total} jobs &middot; {scored} scored &middot; {high_fit} strong matches (7+)</p>
+<p class="subtitle">{total} jobs &middot; {scored} scored &middot; {moderate_plus} rated 5+ &middot; {high_fit} strong (7+){f' &middot; {failed} failed' if failed else ''}</p>
 
 <div class="summary">
   <div class="stat-card stat-total"><div class="stat-num">{total}</div><div class="stat-label">Total Jobs</div></div>
   <div class="stat-card stat-ok"><div class="stat-num">{ready}</div><div class="stat-label">Ready (desc + URL)</div></div>
-  <div class="stat-card stat-scored"><div class="stat-num">{scored}</div><div class="stat-label">Scored by LLM</div></div>
+  <div class="stat-card stat-scored"><div class="stat-num">{scored}</div><div class="stat-label">Scored (1–10)</div></div>
   <div class="stat-card stat-high"><div class="stat-num">{high_fit}</div><div class="stat-label">Strong Fit (7+)</div></div>
 </div>
 
 <div class="filters">
   <span class="filter-label">Score:</span>
-  <button class="filter-btn active" onclick="filterScore(0)">All 5+</button>
+  <button class="filter-btn active" onclick="filterScore(1)">All scored</button>
+  <button class="filter-btn" onclick="filterScore(5)">5+</button>
   <button class="filter-btn" onclick="filterScore(7)">7+ Strong</button>
   <button class="filter-btn" onclick="filterScore(8)">8+ Excellent</button>
   <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
@@ -334,10 +401,13 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
 <div id="job-count" class="job-count"></div>
 
+{empty_notice}
+{failed_section}
+
 {job_sections}
 
 <script>
-let minScore = 0;
+let minScore = 1;
 let searchText = '';
 
 function filterScore(min) {{
@@ -359,7 +429,7 @@ function applyFilters() {{
     total++;
     const score = parseInt(card.dataset.score) || 0;
     const text = card.textContent.toLowerCase();
-    const scoreMatch = score >= (minScore || 5);
+    const scoreMatch = !card.classList.contains('failed-card') && score >= minScore;
     const textMatch = !searchText || text.includes(searchText);
     if (scoreMatch && textMatch) {{
       card.classList.remove('hidden');
